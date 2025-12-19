@@ -346,13 +346,16 @@ navigator = {{
             push_frame = PushFrame()
             push_frame.ParseFromString(message)
             logid = push_frame.logid
+            logger.info(f"PushFrame parsed, logid: {logid}, payload length: {len(push_frame.payload)}")
             
             # 解压payload
             decompressed = gzip.decompress(push_frame.payload)
+            logger.info(f"Decompressed payload length: {len(decompressed)}")
             
             # 解析Response
             response = Response()
             response.ParseFromString(decompressed)
+            logger.info(f"Response parsed, needAck: {response.needAck}, messages count: {len(response.messagesList)}")
             
             # 发送ACK
             if response.needAck:
@@ -362,9 +365,11 @@ navigator = {{
                 ack_frame.payloadType = response.internalExt
                 ack_data = ack_frame.SerializeToString()
                 ws.send(ack_data, websocket.ABNF.OPCODE_BINARY)
+                logger.info("ACK sent")
             
             # 处理消息
             for msg in response.messagesList:
+                logger.info(f"Message method: {msg.method}")
                 if msg.method == 'WebcastChatMessage':
                     self._handle_chat_message(msg.payload)
                     
