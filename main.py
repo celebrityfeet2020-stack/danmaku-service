@@ -1,29 +1,41 @@
-#!/usr/bin/env python3
+# coding=utf-8
 """
-抖音弹幕抓取服务
-- 通过SOCKS5代理连接抖音直播间
-- 抓取弹幕后推送到Agent7后端
+抖音直播弹幕抓取服务
+基于 DouyinLiveRecorder 项目实现
 """
-
-import os
-import sys
-import json
-import time
-import queue
-import hashlib
-import random
-import string
-import codecs
-import logging
-import threading
-import re
+import _thread
 import gzip
-from typing import Optional, Callable, Dict, Any
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import threading
+import time
+from typing import Optional
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 
 import requests
 import websocket
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from google.protobuf import json_format
+from pydantic import BaseModel
+
+# 导入protobuf定义
+from dy_pb2 import PushFrame, Response, ChatMessage
+
+# 尝试导入JS引擎
+try:
+    from py_mini_racer import MiniRacer
+    JS_ENGINE = "py_mini_racer"
+except ImportError:
+    try:
+        import js2py
+        JS_ENGINE = "js2py"
+    except ImportError:
+        JS_ENGINE = None
 
 # 配置日志
 logging.basicConfig(
@@ -31,255 +43,251 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('danmaku-service')
+logger.info(f"Using {JS_ENGINE} for JS execution")
 
-# 环境变量配置
-SOCKS5_PROXY = os.getenv('SOCKS5_PROXY', 'socks5://10.100.100.1:1080')
-AGENT7_API_URL = os.getenv('AGENT7_API_URL', 'http://192.168.9.125:12777/api/danmaku/receive')
-LIVE_ID = os.getenv('LIVE_ID', '')
+app = FastAPI(title="Danmaku Service")
 
-# 尝试导入py_mini_racer，如果失败则使用execjs
-try:
-    from py_mini_racer import MiniRacer
-    USE_MINI_RACER = True
-    logger.info("Using py_mini_racer for JS execution")
-except ImportError:
-    try:
-        import execjs
-        USE_MINI_RACER = False
-        logger.info("Using execjs for JS execution")
-    except ImportError:
-        logger.error("Neither py_mini_racer nor execjs available!")
-        USE_MINI_RACER = None
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# 全局变量
+current_fetcher: Optional['DanmakuFetcher'] = None
+fetcher_lock = threading.Lock()
 
-@dataclass
-class DanmuMessage:
-    """弹幕消息数据类"""
-    type: str  # 消息类型: chat, gift, like, enter, follow
-    nickname: str  # 用户昵称
-    content: str  # 消息内容
-    user_id: str = ""  # 用户ID
-    avatar: str = ""  # 头像URL
-    level: int = 0  # 用户等级
-    timestamp: float = 0  # 时间戳
-    raw_data: Dict = None  # 原始数据
+# 请求模型
+class StartRequest(BaseModel):
+    live_id: str
+    callback_url: str
+    proxy: Optional[str] = None
 
+class StopRequest(BaseModel):
+    live_id: str
 
-class DouyinDanmuFetcher:
-    """抖音弹幕抓取器"""
+# 工具函数
+def get_ms_stub(live_room_real_id, user_unique_id):
+    """生成签名所需的stub"""
+    params = {
+        "live_id": "1",
+        "aid": "6383",
+        "version_code": 180800,
+        "webcast_sdk_version": '1.0.14-beta.0',
+        "room_id": live_room_real_id,
+        "sub_room_id": "",
+        "sub_channel_id": "",
+        "did_rule": "3",
+        "user_unique_id": user_unique_id,
+        "device_platform": "web",
+        "device_type": "",
+        "ac": "",
+        "identity": "audience"
+    }
+    sig_params = ','.join([f'{k}={v}' for k, v in params.items()])
+    return hashlib.md5(sig_params.encode()).hexdigest()
+
+def build_request_url(url: str, user_agent: str) -> str:
+    """构建请求URL"""
+    parsed_url = urlparse(url)
+    existing_params = parse_qs(parsed_url.query)
+    existing_params['aid'] = ['6383']
+    existing_params['device_platform'] = ['web']
+    existing_params['browser_language'] = ['zh-CN']
+    existing_params['browser_platform'] = ['Win32']
+    existing_params['browser_name'] = [user_agent.split('/')[0]]
+    existing_params['browser_version'] = [
+        user_agent.split(existing_params['browser_name'][0])[-1][1:]]
+    new_query_string = urlencode(existing_params, doseq=True)
+    new_url = urlunparse((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        parsed_url.path,
+        parsed_url.params,
+        new_query_string,
+        parsed_url.fragment
+    ))
+    return new_url
+
+def get_request_headers():
+    """获取请求头"""
+    return {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://live.douyin.com/',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'accept-language': 'zh-CN,zh;q=0.9',
+    }
+
+class DanmakuFetcher:
+    """弹幕抓取器"""
     
-    def __init__(
-        self,
-        live_id: str,
-        proxy: str = None,
-        on_message: Callable[[DanmuMessage], None] = None,
-        on_connect: Callable[[str], None] = None,
-        on_disconnect: Callable[[str], None] = None,
-        on_error: Callable[[str, Exception], None] = None,
-    ):
+    def __init__(self, live_id: str, callback_url: str, proxy: Optional[str] = None):
         self.live_id = live_id
+        self.callback_url = callback_url
         self.proxy = proxy
-        
-        # 回调函数
-        self.on_message = on_message
-        self.on_connect = on_connect
-        self.on_disconnect = on_disconnect
-        self.on_error = on_error
-        
-        # 消息队列
-        self.message_queue: queue.Queue = queue.Queue(maxsize=1000)
-        
-        # 状态
+        self.room_id = None
+        self.room_real_id = None
+        self.ttwid = None
+        self.user_agent = get_request_headers()['user-agent']
+        self.ws = None
+        self.stop_signal = False
         self._running = False
         self._connected = False
-        self._thread: Optional[threading.Thread] = None
-        self._heartbeat_thread: Optional[threading.Thread] = None
+        self.danmu_count = 0
+        self.user_unique_id = random.randint(7300000000000000000, 7999999999999999999)
         
-        # 缓存
-        self.__ttwid = None
-        self.__room_id = None
-        
-        # HTTP会话
-        self.session = requests.Session()
-        if proxy:
-            self.session.proxies = {
-                'http': proxy,
-                'https': proxy
-            }
-        
-        # 配置
-        self.host = "https://www.douyin.com/"
-        self.live_url = "https://live.douyin.com/"
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-        self.headers = {'User-Agent': self.user_agent}
-        
-        # WebSocket
-        self.ws: Optional[websocket.WebSocketApp] = None
-        
-        # JS目录
-        self.js_dir = os.path.dirname(os.path.abspath(__file__))
+        # 加载JS引擎
+        self.js_ctx = None
+        self._init_js_engine()
     
-    @property
-    def ttwid(self) -> str:
-        """获取ttwid cookie"""
-        if self.__ttwid:
-            return self.__ttwid
+    def _init_js_engine(self):
+        """初始化JS引擎"""
+        js_path = os.path.join(os.path.dirname(__file__), 'webmssdk.js')
+        if not os.path.exists(js_path):
+            logger.warning("webmssdk.js not found, signature will be empty")
+            return
+        
         try:
-            response = self.session.get(self.live_url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            self.__ttwid = response.cookies.get('ttwid')
-            logger.info(f"Got ttwid: {self.__ttwid[:20]}...")
-            return self.__ttwid
+            with open(js_path, 'r', encoding='utf-8') as f:
+                js_code = f.read()
+            
+            js_dom = f"""
+document = {{}}
+window = {{}}
+navigator = {{
+  'userAgent': '{self.user_agent}'
+}}
+""".strip()
+            
+            if JS_ENGINE == "py_mini_racer":
+                self.js_ctx = MiniRacer()
+                self.js_ctx.eval(js_dom + js_code)
+            elif JS_ENGINE == "js2py":
+                self.js_ctx = js2py.EvalJs()
+                self.js_ctx.execute(js_dom + js_code)
+            
+            logger.info("JS engine initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to get ttwid: {e}")
-            if self.on_error:
-                self.on_error(self.live_id, e)
-            return ""
+            logger.error(f"Failed to init JS engine: {e}")
+            self.js_ctx = None
     
-    @property
-    def room_id(self) -> str:
-        """获取真实room_id"""
-        if self.__room_id:
-            return self.__room_id
-        
-        url = self.live_url + self.live_id
-        headers = {
-            "User-Agent": self.user_agent,
-            "cookie": f"ttwid={self.ttwid}&msToken={self._generate_ms_token()}; __ac_nonce=0123407cc00a9e438deb4",
-        }
-        try:
-            response = self.session.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            # 尝试多种模式匹配room_id
-            patterns = [
-                r'roomId\\":\\"(\d+)\\"',  # 旧版本格式
-                r'id_str\\":\\"(\d+)\\"',  # 新版本格式
-                r'room_id\\":\\"(\d+)\\"',  # 另一种格式
-                r'"roomId":"(\d+)"',  # JSON格式
-                r'"id_str":"(\d+)"',  # JSON格式
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, response.text)
-                if match:
-                    self.__room_id = match.group(1)
-                    logger.info(f"Got room_id: {self.__room_id} (pattern: {pattern[:20]}...)")
-                    return self.__room_id
-            
-            logger.warning(f"No room_id found in page, response length: {len(response.text)}")
-        except Exception as e:
-            logger.error(f"Failed to get room_id: {e}")
-            if self.on_error:
-                self.on_error(self.live_id, e)
-        return ""
-    
-    def _generate_ms_token(self, length: int = 182) -> str:
-        """生成msToken"""
-        chars = string.ascii_letters + string.digits + '-_'
-        return ''.join(random.choice(chars) for _ in range(length))
-    
-    def _generate_signature(self, wss: str) -> str:
-        """生成WebSocket签名"""
-        import urllib.parse
-        
-        params = ("live_id,aid,version_code,webcast_sdk_version,"
-                  "room_id,sub_room_id,sub_channel_id,did_rule,"
-                  "user_unique_id,device_platform,device_type,ac,"
-                  "identity").split(',')
-        wss_params = urllib.parse.urlparse(wss).query.split('&')
-        wss_maps = {i.split('=')[0]: i.split("=")[-1] for i in wss_params}
-        tpl_params = [f"{i}={wss_maps.get(i, '')}" for i in params]
-        param = ','.join(tpl_params)
-        
-        md5 = hashlib.md5()
-        md5.update(param.encode())
-        md5_param = md5.hexdigest()
-        
-        # 加载签名JS
-        sign_js_path = os.path.join(self.js_dir, 'js', 'sign.js')
-        if not os.path.exists(sign_js_path):
-            sign_js_path = os.path.join(self.js_dir, 'sign.js')
-        
-        if not os.path.exists(sign_js_path):
-            logger.warning(f"sign.js not found at {sign_js_path}, using empty signature")
+    def _get_signature(self, room_real_id):
+        """生成签名"""
+        if not self.js_ctx:
             return ""
         
         try:
-            with codecs.open(sign_js_path, 'r', encoding='utf8') as f:
-                script = f.read()
-            
-            if USE_MINI_RACER:
-                ctx = MiniRacer()
-                ctx.eval(script)
-                signature = ctx.call("get_sign", md5_param)
-            elif USE_MINI_RACER is False:
-                import execjs
-                ctx = execjs.compile(script)
-                signature = ctx.call("get_sign", md5_param)
+            ms_stub = get_ms_stub(room_real_id, self.user_unique_id)
+            if JS_ENGINE == "py_mini_racer":
+                signature = self.js_ctx.eval(f"get_sign('{ms_stub}')")
+            elif JS_ENGINE == "js2py":
+                signature = self.js_ctx.get_sign(ms_stub)
             else:
                 signature = ""
-            
             return signature
         except Exception as e:
             logger.error(f"Failed to generate signature: {e}")
-            if self.on_error:
-                self.on_error(self.live_id, e)
             return ""
     
-    def start(self):
-        """启动弹幕抓取（非阻塞）"""
-        if self._running:
-            return
+    def _get_ttwid(self):
+        """获取ttwid"""
+        try:
+            proxies = {'http': self.proxy, 'https': self.proxy} if self.proxy else None
+            resp = requests.get(
+                'https://live.douyin.com/',
+                headers=get_request_headers(),
+                proxies=proxies,
+                timeout=10
+            )
+            cookies = resp.cookies.get_dict()
+            self.ttwid = cookies.get('ttwid', '')
+            if self.ttwid:
+                logger.info(f"Got ttwid: {self.ttwid[:30]}...")
+            return self.ttwid
+        except Exception as e:
+            logger.error(f"Failed to get ttwid: {e}")
+            return None
+    
+    def _get_room_info(self):
+        """获取直播间信息"""
+        try:
+            proxies = {'http': self.proxy, 'https': self.proxy} if self.proxy else None
+            url = f'https://live.douyin.com/{self.live_id}'
+            resp = requests.get(
+                url,
+                headers={**get_request_headers(), 'cookie': f'ttwid={self.ttwid}'},
+                proxies=proxies,
+                timeout=10
+            )
+            
+            # 尝试多种模式匹配room_id
+            patterns = [
+                r'roomId\\":\\"(\d+)\\"',
+                r'"roomId":"(\d+)"',
+                r'room_id["\':]+(\d+)',
+                r'id_str\\":\\"(\d+)\\"',
+                r'"id_str":"(\d+)"',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, resp.text)
+                if match:
+                    self.room_real_id = match.group(1)
+                    logger.info(f"Got room_real_id: {self.room_real_id} (pattern: {pattern[:30]}...)")
+                    return self.room_real_id
+            
+            logger.error("Failed to get room_real_id from page")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get room info: {e}")
+            return None
+    
+    def _get_ws_url(self):
+        """获取WebSocket URL"""
+        signature = self._get_signature(self.room_real_id)
         
+        webcast_params = {
+            "room_id": self.room_real_id,
+            "compress": 'gzip',
+            "version_code": 180800,
+            "webcast_sdk_version": '1.0.14-beta.0',
+            "live_id": "1",
+            "did_rule": "3",
+            "user_unique_id": self.user_unique_id,
+            "identity": "audience",
+            "signature": signature,
+        }
+        
+        base_url = f"wss://webcast5-ws-web-lf.douyin.com/webcast/im/push/v2/?{'&'.join([f'{k}={v}' for k, v in webcast_params.items()])}"
+        return build_request_url(base_url, self.user_agent)
+    
+    def start(self):
+        """启动弹幕抓取"""
         self._running = True
-        self._thread = threading.Thread(target=self._connect_websocket, daemon=True)
-        self._thread.start()
-        logger.info(f"Started fetcher for live_id: {self.live_id}")
-    
-    def stop(self):
-        """停止弹幕抓取"""
-        self._running = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
-        self._connected = False
-        logger.info(f"Stopped fetcher for live_id: {self.live_id}")
-    
-    def is_running(self) -> bool:
-        """是否正在运行"""
-        return self._running and self._connected
-    
-    def _connect_websocket(self):
-        """连接WebSocket"""
-        if not self.room_id:
-            logger.error("Failed to get room_id, cannot connect")
+        self.stop_signal = False
+        
+        # 获取ttwid
+        if not self._get_ttwid():
+            logger.error("Failed to get ttwid")
             self._running = False
             return
         
-        wss = (
-            f"wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
-            f"&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
-            f"&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
-            f"&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32"
-            f"&browser_name=Mozilla"
-            f"&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
-            f"%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
-            f"&browser_online=true&tz_name=Asia/Shanghai"
-            f"&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
-            f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
-            f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
-            f"wrds_v:7392094459690748497"
-            f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
-            f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
-            f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0"
-        )
+        # 获取房间信息
+        if not self._get_room_info():
+            logger.error("Failed to get room info")
+            self._running = False
+            return
         
-        signature = self._generate_signature(wss)
-        if signature:
-            wss += f"&signature={signature}"
+        # 连接WebSocket
+        self._connect_websocket()
+    
+    def _connect_websocket(self):
+        """连接WebSocket"""
+        ws_url = self._get_ws_url()
+        logger.info(f"Connecting to WebSocket: {ws_url[:100]}...")
         
         headers = {
             "cookie": f"ttwid={self.ttwid}",
@@ -292,9 +300,7 @@ class DouyinDanmuFetcher:
         http_proxy_port = None
         
         if self.proxy:
-            # 解析代理URL: socks5://host:port
-            import urllib.parse
-            parsed = urllib.parse.urlparse(self.proxy)
+            parsed = urlparse(self.proxy)
             if parsed.scheme in ('socks5', 'socks5h'):
                 proxy_type = 'socks5'
             elif parsed.scheme in ('http', 'https'):
@@ -304,7 +310,7 @@ class DouyinDanmuFetcher:
             logger.info(f"Using proxy: {proxy_type}://{http_proxy_host}:{http_proxy_port}")
         
         self.ws = websocket.WebSocketApp(
-            wss,
+            ws_url,
             header=headers,
             on_open=self._on_ws_open,
             on_message=self._on_ws_message,
@@ -320,301 +326,203 @@ class DouyinDanmuFetcher:
             )
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            if self.on_error:
-                self.on_error(self.live_id, e)
         finally:
             self._running = False
             self._connected = False
     
     def _on_ws_open(self, ws):
-        """WebSocket连接成功"""
-        self._connected = True
+        """WebSocket连接打开"""
         logger.info(f"WebSocket connected for live_id: {self.live_id}")
-        
+        self._connected = True
         # 启动心跳线程
-        self._heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
-        self._heartbeat_thread.start()
-        
-        if self.on_connect:
-            self.on_connect(self.live_id)
+        _thread.start_new_thread(self._heartbeat, (ws,))
     
-    def _on_ws_message(self, ws, message):
-        """收到WebSocket消息"""
+    def _on_ws_message(self, ws: websocket.WebSocketApp, message: bytes):
+        """处理WebSocket消息"""
         try:
-            # 尝试解压gzip
-            try:
-                message = gzip.decompress(message)
-            except:
-                pass
+            # 解析PushFrame
+            push_frame = PushFrame()
+            push_frame.ParseFromString(message)
+            logid = push_frame.logid
             
-            # 调试：记录收到的消息长度
-            logger.info(f"Received WS message, length: {len(message)}")
+            # 解压payload
+            decompressed = gzip.decompress(push_frame.payload)
             
-            # 解析消息（简化版，实际需要protobuf解析）
-            # 这里使用正则匹配提取弹幕内容
-            text = message.decode('utf-8', errors='ignore')
+            # 解析Response
+            response = Response()
+            response.ParseFromString(decompressed)
             
-            # 调试：记录消息内容片段（只显示可打印字符）
-            if len(text) > 50:
-                preview = ''.join(c if c.isprintable() or c in '\n\t' else '.' for c in text[:300])
-                logger.info(f"Message preview: {preview}")
+            # 发送ACK
+            if response.needAck:
+                ack_frame = PushFrame()
+                ack_frame.payloadType = 'ack'
+                ack_frame.logid = logid
+                ack_frame.payloadType = response.internalExt
+                ack_data = ack_frame.SerializeToString()
+                ws.send(ack_data, websocket.ABNF.OPCODE_BINARY)
             
-            # 调试：检查是否包含ChatMessage
-            if 'ChatMessage' in text or 'chat' in text.lower():
-                logger.info(f"Found chat-related content in message")
-            
-            # 匹配聊天消息 - 尝试多种模式
-            chat_patterns = [
-                r'WebcastChatMessage.*?nickname[^\x00-\x1f]*?([^\x00-\x1f]{2,20})[^\x00-\x1f]*?content[^\x00-\x1f]*?([^\x00-\x1f]{1,200})',
-                r'nickname["\']?[:\s]*["\']?([^"\' -]{2,20})["\']?.*?content["\']?[:\s]*["\']?([^"\' -]{1,200})',
-            ]
-            
-            for pattern_idx, chat_pattern in enumerate(chat_patterns):
-                matches = re.findall(chat_pattern, text)
-                if matches:
-                    logger.info(f"Pattern {pattern_idx} matched {len(matches)} items")
-                
-                for match in matches:
-                    if len(match) >= 2:
-                        nickname = match[0].strip()
-                        content = match[1].strip()
-                        
-                        if nickname and content and len(content) > 0:
-                            msg = DanmuMessage(
-                                type='chat',
-                                nickname=nickname,
-                                content=content,
-                                timestamp=time.time()
-                            )
-                            
-                            logger.info(f"弹幕: {nickname}: {content}")
-                            
-                            if self.on_message:
-                                self.on_message(msg)
-                            
-                            try:
-                                self.message_queue.put_nowait(msg)
-                            except queue.Full:
-                                pass
-                
-                # 如果找到匹配，跳出模式循环
-                if matches:
-                    break
+            # 处理消息
+            for msg in response.messagesList:
+                if msg.method == 'WebcastChatMessage':
+                    self._handle_chat_message(msg.payload)
+                    
         except Exception as e:
-            logger.error(f"Failed to parse message: {e}")
+            logger.error(f"Error processing message: {e}")
+    
+    def _handle_chat_message(self, payload: bytes):
+        """处理聊天消息"""
+        try:
+            chat_msg = ChatMessage()
+            chat_msg.ParseFromString(payload)
+            data = json_format.MessageToDict(chat_msg, preserving_proto_field_name=True)
+            
+            user = data.get('user', {}).get('nickName', 'Unknown')
+            content = data.get('content', '')
+            
+            self.danmu_count += 1
+            logger.info(f"[弹幕] {user}: {content}")
+            
+            # 推送到回调URL
+            self._push_danmu(user, content)
+            
+        except Exception as e:
+            logger.error(f"Error handling chat message: {e}")
+    
+    def _push_danmu(self, user: str, content: str):
+        """推送弹幕到回调URL"""
+        try:
+            payload = {
+                "live_id": self.live_id,
+                "user": user,
+                "content": content,
+                "timestamp": int(time.time() * 1000)
+            }
+            
+            resp = requests.post(
+                self.callback_url,
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=5
+            )
+            
+            if resp.status_code != 200:
+                logger.warning(f"Failed to push danmu: {resp.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Error pushing danmu: {e}")
+    
+    def _heartbeat(self, ws: websocket.WebSocketApp):
+        """心跳线程"""
+        while not self.stop_signal and self._running:
+            time.sleep(10)
+            if self.stop_signal or not self._running:
+                break
+            try:
+                # 发送心跳包
+                obj = PushFrame()
+                obj.payloadType = 'hb'
+                data = obj.SerializeToString()
+                ws.send(data, websocket.ABNF.OPCODE_BINARY)
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
+                break
+        
+        logger.info("Heartbeat thread stopped")
     
     def _on_ws_error(self, ws, error):
         """WebSocket错误"""
         logger.error(f"WebSocket error: {error}")
-        if self.on_error:
-            self.on_error(self.live_id, error)
     
     def _on_ws_close(self, ws, close_status_code, close_msg):
         """WebSocket关闭"""
-        self._connected = False
         logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-        if self.on_disconnect:
-            self.on_disconnect(self.live_id)
-    
-    def _send_heartbeat(self):
-        """发送心跳包"""
-        while self._running and self._connected:
-            try:
-                # 发送心跳
-                if self.ws:
-                    self.ws.send(b'\x3a\x02\x68\x62', opcode=websocket.ABNF.OPCODE_BINARY)
-            except Exception as e:
-                logger.debug(f"Heartbeat error: {e}")
-            time.sleep(10)
-
-
-class DanmakuService:
-    """弹幕服务主类"""
-    
-    def __init__(self, live_id: str, proxy: str, agent7_url: str, thread_id: str = ""):
-        self.live_id = live_id
-        self.proxy = proxy
-        self.agent7_url = agent7_url
-        self.thread_id = thread_id  # A7会话ID
-        self.fetcher: Optional[DouyinDanmuFetcher] = None
-        self.running = False
-        self.message_count = 0
-        self.push_count = 0
-    
-    def on_message(self, msg: DanmuMessage):
-        """收到弹幕消息"""
-        self.message_count += 1
-        
-        # 推送到Agent7
-        try:
-            data = {
-                'live_id': self.live_id,
-                'thread_id': self.thread_id,  # A7会话ID
-                'type': msg.type,
-                'nickname': msg.nickname,
-                'content': msg.content,
-                'user_id': msg.user_id,
-                'timestamp': msg.timestamp,
-            }
-            
-            response = requests.post(
-                self.agent7_url,
-                json=data,
-                timeout=5
-            )
-            
-            if response.status_code == 200:
-                self.push_count += 1
-                logger.debug(f"Pushed message to Agent7: {msg.nickname}: {msg.content}")
-            else:
-                logger.warning(f"Failed to push to Agent7: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to push to Agent7: {e}")
-    
-    def on_connect(self, live_id: str):
-        """连接成功"""
-        logger.info(f"Connected to live room: {live_id}")
-    
-    def on_disconnect(self, live_id: str):
-        """断开连接"""
-        logger.info(f"Disconnected from live room: {live_id}")
-        
-        # 自动重连
-        if self.running:
-            logger.info("Reconnecting in 5 seconds...")
-            time.sleep(5)
-            self.start()
-    
-    def on_error(self, live_id: str, error: Exception):
-        """错误处理"""
-        logger.error(f"Error in live room {live_id}: {error}")
-    
-    def start(self):
-        """启动服务"""
-        self.running = True
-        
-        self.fetcher = DouyinDanmuFetcher(
-            live_id=self.live_id,
-            proxy=self.proxy,
-            on_message=self.on_message,
-            on_connect=self.on_connect,
-            on_disconnect=self.on_disconnect,
-            on_error=self.on_error,
-        )
-        
-        self.fetcher.start()
-        logger.info(f"Danmaku service started for live_id: {self.live_id}")
+        self._connected = False
     
     def stop(self):
-        """停止服务"""
-        self.running = False
-        if self.fetcher:
-            self.fetcher.stop()
-        logger.info("Danmaku service stopped")
+        """停止弹幕抓取"""
+        self.stop_signal = True
+        self._running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+        self._connected = False
+        logger.info(f"Stopped fetcher for live_id: {self.live_id}")
     
-    def get_status(self) -> dict:
-        """获取状态"""
-        return {
-            'live_id': self.live_id,
-            'running': self.running,
-            'connected': self.fetcher.is_running() if self.fetcher else False,
-            'message_count': self.message_count,
-            'push_count': self.push_count,
-        }
+    def is_running(self) -> bool:
+        """是否正在运行"""
+        return self._running and self._connected
 
 
-# FastAPI服务
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
-
-app = FastAPI(title="弹幕抓取服务", version="1.0.0")
-
-# 全局服务实例
-service: Optional[DanmakuService] = None
-
-
-class StartRequest(BaseModel):
-    live_id: str
-    proxy: str = SOCKS5_PROXY
-    agent7_url: str = AGENT7_API_URL
-    thread_id: str = ""  # A7会话ID
-
-
-class StopRequest(BaseModel):
-    pass
-
-
+# API端点
 @app.get("/")
 async def root():
-    return {"service": "danmaku-service", "status": "running"}
-
+    return {"status": "ok", "service": "danmaku-service"}
 
 @app.get("/status")
-async def get_status():
-    global service
-    if service:
-        return service.get_status()
-    return {"running": False}
-
+async def status():
+    global current_fetcher
+    with fetcher_lock:
+        if current_fetcher and current_fetcher.is_running():
+            return {
+                "running": True,
+                "live_id": current_fetcher.live_id,
+                "danmu_count": current_fetcher.danmu_count
+            }
+        return {"running": False}
 
 @app.post("/start")
-async def start_service(req: StartRequest):
-    global service
+async def start_service(request: StartRequest):
+    global current_fetcher
     
-    # 如果已有服务在运行，先停止它
-    if service and service.running:
-        old_live_id = service.live_id
-        service.stop()
-        logger.info(f"Stopped old service for live_id: {old_live_id}")
-    
-    service = DanmakuService(
-        live_id=req.live_id,
-        proxy=req.proxy,
-        agent7_url=req.agent7_url,
-        thread_id=req.thread_id,
-    )
-    service.start()
-    
-    return {"success": True, "message": f"Started for live_id: {req.live_id}", "thread_id": req.thread_id}
-
+    with fetcher_lock:
+        # 如果已有服务在运行，先停止
+        if current_fetcher and current_fetcher.is_running():
+            logger.info(f"Stopping old service for live_id: {current_fetcher.live_id}")
+            current_fetcher.stop()
+            time.sleep(1)
+        
+        # 创建新的抓取器
+        current_fetcher = DanmakuFetcher(
+            live_id=request.live_id,
+            callback_url=request.callback_url,
+            proxy=request.proxy
+        )
+        
+        # 在后台线程启动
+        thread = threading.Thread(target=current_fetcher.start, daemon=True)
+        thread.start()
+        
+        logger.info(f"Started fetcher for live_id: {request.live_id}")
+        
+    return {"success": True, "message": f"Started for live_id: {request.live_id}"}
 
 @app.post("/stop")
-async def stop_service():
-    global service
+async def stop_service(request: StopRequest = None):
+    global current_fetcher
     
-    if not service or not service.running:
-        return {"success": False, "message": "Service not running"}
-    
-    service.stop()
-    return {"success": True, "message": "Service stopped"}
-
+    with fetcher_lock:
+        if current_fetcher:
+            current_fetcher.stop()
+            live_id = current_fetcher.live_id
+            current_fetcher = None
+            return {"success": True, "message": f"Stopped for live_id: {live_id}"}
+        return {"success": False, "message": "No service running"}
 
 @app.post("/stop/{live_id}")
 async def stop_service_by_id(live_id: str):
-    """根据live_id停止服务"""
-    global service
+    global current_fetcher
     
-    if not service or not service.running:
-        return {"success": False, "message": "Service not running"}
-    
-    if service.live_id != live_id:
-        return {"success": False, "message": f"Live ID mismatch: {service.live_id} != {live_id}"}
-    
-    service.stop()
-    return {"success": True, "message": f"Service stopped for live_id: {live_id}"}
+    with fetcher_lock:
+        if current_fetcher and current_fetcher.live_id == live_id:
+            current_fetcher.stop()
+            current_fetcher = None
+            return {"success": True, "message": f"Stopped for live_id: {live_id}"}
+        return {"success": False, "message": f"No service running for live_id: {live_id}"}
 
 
 if __name__ == "__main__":
-    # 如果设置了LIVE_ID环境变量，自动启动
-    if LIVE_ID:
-        logger.info(f"Auto-starting with LIVE_ID: {LIVE_ID}")
-        service = DanmakuService(
-            live_id=LIVE_ID,
-            proxy=SOCKS5_PROXY,
-            agent7_url=AGENT7_API_URL,
-        )
-        service.start()
-    
-    # 启动API服务
+    import uvicorn
+    print("=== Starting Danmaku Service ===")
     uvicorn.run(app, host="0.0.0.0", port=16888)
