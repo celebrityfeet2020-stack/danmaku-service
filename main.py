@@ -388,14 +388,18 @@ navigator = {{
         except Exception as e:
             logger.error(f"Error handling chat message: {e}")
     
-    def _push_danmu(self, user: str, content: str):
+    def _push_danmu(self, user: str, content: str, user_id: str = ""):
         """推送弹幕到回调URL"""
         try:
+            from datetime import datetime
             payload = {
                 "live_id": self.live_id,
-                "user": user,
+                "type": "chat",
+                "user_id": user_id or str(hash(user) % 10000000000),  # 生成一个伪user_id
+                "nickname": user,
                 "content": content,
-                "timestamp": int(time.time() * 1000)
+                "timestamp": datetime.now().isoformat(),
+                "extra": {}
             }
             
             resp = requests.post(
