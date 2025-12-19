@@ -24,5 +24,8 @@ curl -x socks5://10.100.100.1:1080 -s --connect-timeout 5 https://httpbin.org/ip
 
 echo "=== Starting Danmaku Service ==="
 
+# 设置protobuf环境变量以兼容旧版本生成的pb2文件
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
 # 启动弹幕服务
 exec python main.py
