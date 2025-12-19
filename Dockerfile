@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir \
 
 # 复制代码
 COPY main.py .
-COPY js/ ./js/
+COPY dy_pb2.py .
+COPY webmssdk.js .
 COPY entrypoint.sh .
 
 # 复制WireGuard配置
