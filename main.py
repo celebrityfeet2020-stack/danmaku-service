@@ -334,9 +334,16 @@ class DouyinDanmuFetcher:
             except:
                 pass
             
+            # 调试：记录收到的消息长度
+            logger.debug(f"Received message, length: {len(message)}")
+            
             # 解析消息（简化版，实际需要protobuf解析）
             # 这里使用正则匹配提取弹幕内容
             text = message.decode('utf-8', errors='ignore')
+            
+            # 调试：检查是否包含ChatMessage
+            if 'ChatMessage' in text or 'chat' in text.lower():
+                logger.info(f"Found chat-related content in message")
             
             # 匹配聊天消息
             chat_pattern = r'WebcastChatMessage.*?nickname[^\x00-\x1f]*?([^\x00-\x1f]{2,20})[^\x00-\x1f]*?content[^\x00-\x1f]*?([^\x00-\x1f]{1,200})'
