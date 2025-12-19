@@ -395,10 +395,11 @@ class DouyinDanmuFetcher:
 class DanmakuService:
     """弹幕服务主类"""
     
-    def __init__(self, live_id: str, proxy: str, agent7_url: str):
+    def __init__(self, live_id: str, proxy: str, agent7_url: str, thread_id: str = ""):
         self.live_id = live_id
         self.proxy = proxy
         self.agent7_url = agent7_url
+        self.thread_id = thread_id  # A7会话ID
         self.fetcher: Optional[DouyinDanmuFetcher] = None
         self.running = False
         self.message_count = 0
@@ -412,6 +413,7 @@ class DanmakuService:
         try:
             data = {
                 'live_id': self.live_id,
+                'thread_id': self.thread_id,  # A7会话ID
                 'type': msg.type,
                 'nickname': msg.nickname,
                 'content': msg.content,
@@ -500,6 +502,7 @@ class StartRequest(BaseModel):
     live_id: str
     proxy: str = SOCKS5_PROXY
     agent7_url: str = AGENT7_API_URL
+    thread_id: str = ""  # A7会话ID
 
 
 class StopRequest(BaseModel):
@@ -530,10 +533,11 @@ async def start_service(req: StartRequest):
         live_id=req.live_id,
         proxy=req.proxy,
         agent7_url=req.agent7_url,
+        thread_id=req.thread_id,
     )
     service.start()
     
-    return {"success": True, "message": f"Started for live_id: {req.live_id}"}
+    return {"success": True, "message": f"Started for live_id: {req.live_id}", "thread_id": req.thread_id}
 
 
 @app.post("/stop")
@@ -545,6 +549,21 @@ async def stop_service():
     
     service.stop()
     return {"success": True, "message": "Service stopped"}
+
+
+@app.post("/stop/{live_id}")
+async def stop_service_by_id(live_id: str):
+    """根据live_id停止服务"""
+    global service
+    
+    if not service or not service.running:
+        return {"success": False, "message": "Service not running"}
+    
+    if service.live_id != live_id:
+        return {"success": False, "message": f"Live ID mismatch: {service.live_id} != {live_id}"}
+    
+    service.stop()
+    return {"success": True, "message": f"Service stopped for live_id: {live_id}"}
 
 
 if __name__ == "__main__":
