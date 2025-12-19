@@ -334,11 +334,13 @@ navigator = {{
         """WebSocket连接打开"""
         logger.info(f"WebSocket connected for live_id: {self.live_id}")
         self._connected = True
+        logger.info("Starting heartbeat thread...")
         # 启动心跳线程
         _thread.start_new_thread(self._heartbeat, (ws,))
     
     def _on_ws_message(self, ws: websocket.WebSocketApp, message: bytes):
         """处理WebSocket消息"""
+        logger.info(f"Received WS message, length: {len(message)} bytes")
         try:
             # 解析PushFrame
             push_frame = PushFrame()
@@ -417,6 +419,7 @@ navigator = {{
     
     def _heartbeat(self, ws: websocket.WebSocketApp):
         """心跳线程"""
+        logger.info("Heartbeat thread started")
         while not self.stop_signal and self._running:
             time.sleep(10)
             if self.stop_signal or not self._running:
@@ -427,6 +430,7 @@ navigator = {{
                 obj.payloadType = 'hb'
                 data = obj.SerializeToString()
                 ws.send(data, websocket.ABNF.OPCODE_BINARY)
+                logger.info("Heartbeat sent")
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
                 break
