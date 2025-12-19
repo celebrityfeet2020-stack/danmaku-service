@@ -13,7 +13,7 @@ WORKDIR /app
 # 安装Python依赖
 RUN pip install --no-cache-dir \
     requests \
-    websockets \
+    websocket-client \
     pysocks \
     fastapi \
     uvicorn \
