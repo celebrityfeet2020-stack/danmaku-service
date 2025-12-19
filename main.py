@@ -348,44 +348,60 @@ class DouyinDanmuFetcher:
                 pass
             
             # 调试：记录收到的消息长度
-            logger.debug(f"Received message, length: {len(message)}")
+            logger.info(f"Received WS message, length: {len(message)}")
             
             # 解析消息（简化版，实际需要protobuf解析）
             # 这里使用正则匹配提取弹幕内容
             text = message.decode('utf-8', errors='ignore')
             
+            # 调试：记录消息内容片段（只显示可打印字符）
+            if len(text) > 50:
+                preview = ''.join(c if c.isprintable() or c in '\n\t' else '.' for c in text[:300])
+                logger.info(f"Message preview: {preview}")
+            
             # 调试：检查是否包含ChatMessage
             if 'ChatMessage' in text or 'chat' in text.lower():
                 logger.info(f"Found chat-related content in message")
             
-            # 匹配聊天消息
-            chat_pattern = r'WebcastChatMessage.*?nickname[^\x00-\x1f]*?([^\x00-\x1f]{2,20})[^\x00-\x1f]*?content[^\x00-\x1f]*?([^\x00-\x1f]{1,200})'
-            matches = re.findall(chat_pattern, text)
+            # 匹配聊天消息 - 尝试多种模式
+            chat_patterns = [
+                r'WebcastChatMessage.*?nickname[^\x00-\x1f]*?([^\x00-\x1f]{2,20})[^\x00-\x1f]*?content[^\x00-\x1f]*?([^\x00-\x1f]{1,200})',
+                r'nickname["\']?[:\s]*["\']?([^"\' -]{2,20})["\']?.*?content["\']?[:\s]*["\']?([^"\' -]{1,200})',
+            ]
             
-            for match in matches:
-                if len(match) >= 2:
-                    nickname = match[0].strip()
-                    content = match[1].strip()
-                    
-                    if nickname and content and len(content) > 0:
-                        msg = DanmuMessage(
-                            type='chat',
-                            nickname=nickname,
-                            content=content,
-                            timestamp=time.time()
-                        )
+            for pattern_idx, chat_pattern in enumerate(chat_patterns):
+                matches = re.findall(chat_pattern, text)
+                if matches:
+                    logger.info(f"Pattern {pattern_idx} matched {len(matches)} items")
+                
+                for match in matches:
+                    if len(match) >= 2:
+                        nickname = match[0].strip()
+                        content = match[1].strip()
                         
-                        logger.info(f"弹幕: {nickname}: {content}")
-                        
-                        if self.on_message:
-                            self.on_message(msg)
-                        
-                        try:
-                            self.message_queue.put_nowait(msg)
-                        except queue.Full:
-                            pass
+                        if nickname and content and len(content) > 0:
+                            msg = DanmuMessage(
+                                type='chat',
+                                nickname=nickname,
+                                content=content,
+                                timestamp=time.time()
+                            )
+                            
+                            logger.info(f"弹幕: {nickname}: {content}")
+                            
+                            if self.on_message:
+                                self.on_message(msg)
+                            
+                            try:
+                                self.message_queue.put_nowait(msg)
+                            except queue.Full:
+                                pass
+                
+                # 如果找到匹配，跳出模式循环
+                if matches:
+                    break
         except Exception as e:
-            logger.debug(f"Failed to parse message: {e}")
+            logger.error(f"Failed to parse message: {e}")
     
     def _on_ws_error(self, ws, error):
         """WebSocket错误"""
