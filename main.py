@@ -397,6 +397,7 @@ navigator = {{
     
     def _push_danmu(self, user: str, content: str, user_id: str = ""):
         """推送弹幕到回调URL"""
+        logger.info(f"Pushing danmu to {self.callback_url}: {user}: {content}")
         try:
             from datetime import datetime
             payload = {
@@ -409,6 +410,7 @@ navigator = {{
                 "extra": {}
             }
             
+            logger.info(f"Push payload: {payload}")
             resp = requests.post(
                 self.callback_url,
                 json=payload,
@@ -416,6 +418,7 @@ navigator = {{
                 timeout=5
             )
             
+            logger.info(f"Push response: {resp.status_code} - {resp.text[:200] if resp.text else 'empty'}")
             if resp.status_code != 200:
                 logger.warning(f"Failed to push danmu: {resp.status_code}")
                 
