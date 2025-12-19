@@ -526,8 +526,11 @@ async def get_status():
 async def start_service(req: StartRequest):
     global service
     
+    # 如果已有服务在运行，先停止它
     if service and service.running:
-        return {"success": False, "message": "Service already running"}
+        old_live_id = service.live_id
+        service.stop()
+        logger.info(f"Stopped old service for live_id: {old_live_id}")
     
     service = DanmakuService(
         live_id=req.live_id,
