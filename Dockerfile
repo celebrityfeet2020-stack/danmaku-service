@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir \
     requests \
     websocket-client \
     pysocks \
+    python-socks[asyncio] \
     fastapi \
     uvicorn \
     py_mini_racer \
