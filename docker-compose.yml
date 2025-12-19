@@ -1,0 +1,23 @@
+services:
+  danmaku-service:
+    container_name: danmaku-service
+    build: .
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    ports:
+      - "16888:8080"
+    environment:
+      - SOCKS5_PROXY=socks5://10.100.100.1:1080
+      - AGENT7_API_URL=http://192.168.9.125:12777/api/danmaku/receive
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - danmaku-net
+
+networks:
+  danmaku-net:
+    driver: bridge
