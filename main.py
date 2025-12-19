@@ -150,11 +150,24 @@ class DouyinDanmuFetcher:
         try:
             response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
-            match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
-            if match:
-                self.__room_id = match.group(1)
-                logger.info(f"Got room_id: {self.__room_id}")
-                return self.__room_id
+            
+            # 尝试多种模式匹配room_id
+            patterns = [
+                r'roomId\\":\\"(\d+)\\"',  # 旧版本格式
+                r'id_str\\":\\"(\d+)\\"',  # 新版本格式
+                r'room_id\\":\\"(\d+)\\"',  # 另一种格式
+                r'"roomId":"(\d+)"',  # JSON格式
+                r'"id_str":"(\d+)"',  # JSON格式
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, response.text)
+                if match:
+                    self.__room_id = match.group(1)
+                    logger.info(f"Got room_id: {self.__room_id} (pattern: {pattern[:20]}...)")
+                    return self.__room_id
+            
+            logger.warning(f"No room_id found in page, response length: {len(response.text)}")
         except Exception as e:
             logger.error(f"Failed to get room_id: {e}")
             if self.on_error:
